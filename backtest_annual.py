@@ -1,0 +1,493 @@
+#!/usr/bin/env python3
+"""
+Walk-Forward 3-Year Backtest with Position Sizing
+模擬過去 3 年，每天依據 stock-analysis skill 的加碼/持平/減碼建議調整倉位。
+
+倉位模型（5 個等級）：
+  強力加碼 → +2 級（上限 100%）
+  加碼     → +1 級
+  持平     →  0  （不動）
+  減碼     → -1 級
+  強力減碼 → -2 級（下限 0%）
+  起始倉位 → 50%（中性）
+
+交易成本：
+  買進手續費 0.1425%
+  賣出手續費 0.1425% + 證交稅 0.3%
+"""
+
+from __future__ import annotations
+import sys
+import warnings
+warnings.filterwarnings('ignore')
+
+import pandas as pd
+import numpy as np
+import yfinance as yf
+from datetime import datetime, timedelta
+
+sys.path.insert(0, '.')
+from tech_analysis import (
+    calc_indicators,
+    build_conditions,
+    compute_outcomes,
+    backtest_conditions,
+    baseline_stats,
+    _group_of,
+)
+
+# ─── 常數 ─────────────────────────────────────────────────────────────────────
+LOOKBACK_DAYS = 125          # 每次回測用的歷史窗口（約 6 個月）
+MIN_WINDOW    = 40           # 最少需要這麼多天才發出信號
+
+COMM_BUY  = 0.001425
+COMM_SELL = 0.001425
+TAX_SELL  = 0.003
+
+# 倉位等級：0%/25%/50%/75%/100%
+LEVELS = [0.0, 0.25, 0.50, 0.75, 1.00]
+START_LEVEL = 2   # 50%
+
+LEVEL_DELTA = {
+    '強力加碼': +2,
+    '加碼':     +1,
+    '持平':      0,
+    '減碼':     -1,
+    '強力減碼': -2,
+}
+
+
+# ─── 數據抓取 ──────────────────────────────────────────────────────────────────
+
+def fetch_extended(symbol: str, years: float = 3.5) -> tuple[pd.DataFrame, str]:
+    """抓取 years 年的歷史數據。"""
+    end   = datetime.now()
+    start = end - timedelta(days=int(years * 365.25))
+    for suffix in ['.TW', '.TWO']:
+        ticker = f'{symbol}{suffix}'
+        df = yf.download(ticker, start=start, end=end, progress=False, auto_adjust=True)
+        if not df.empty:
+            if isinstance(df.columns, pd.MultiIndex):
+                df.columns = df.columns.get_level_values(0)
+            return df, ticker
+    raise ValueError(f'找不到股票 {symbol}')
+
+
+# ─── 信號計算 ──────────────────────────────────────────────────────────────────
+
+def get_signal(window: pd.DataFrame) -> tuple[str, float]:
+    """完全複製 tech_analysis.py 技術面邏輯（不含籌碼面）。"""
+    if len(window) < MIN_WINDOW:
+        return '持平', 0.0
+    try:
+        conditions = build_conditions(window)
+        outcomes   = compute_outcomes(window)
+        base       = baseline_stats(outcomes)
+        bt         = backtest_conditions(conditions, outcomes, base)
+
+        today_flags = {name: bool(cond.iloc[-1]) for name, cond in conditions.items()}
+
+        group_best: dict[str, dict] = {}
+        for name, stats in bt.items():
+            if not today_flags.get(name, False):
+                continue
+            grp = stats['group']
+            if grp not in group_best or abs(stats['weight']) > abs(group_best[grp]['weight']):
+                group_best[grp] = stats
+
+        score = sum(s['weight'] for s in group_best.values())
+
+        if score >= 0.60:   return '強力加碼', score
+        if score >= 0.25:   return '加碼',     score
+        if score <= -0.60:  return '強力減碼', score
+        if score <= -0.25:  return '減碼',     score
+        return '持平', score
+    except Exception:
+        return '持平', 0.0
+
+
+# ─── 倉位管理 ──────────────────────────────────────────────────────────────────
+
+def rebalance(
+    cash: float, shares: float, price: float, target_pct: float
+) -> tuple[float, float, float]:
+    """
+    重新平衡到目標倉位比例。
+    回傳 (new_cash, new_shares, trade_cost)。
+    """
+    if price <= 0:
+        return cash, shares, 0.0
+
+    portfolio = cash + shares * price
+    target_stock = portfolio * target_pct
+    current_stock = shares * price
+    delta = target_stock - current_stock
+
+    if delta > portfolio * 0.01:          # 買入（差距 > 1% 才執行，避免頻繁小額交易）
+        buy_value = min(delta, cash / (1 + COMM_BUY))
+        new_shares  = buy_value / price
+        cost        = buy_value * COMM_BUY
+        cash       -= buy_value + cost
+        shares     += new_shares
+        return cash, shares, cost
+
+    elif delta < -portfolio * 0.01:       # 賣出
+        sell_shares = min(shares, -delta / price)
+        gross       = sell_shares * price
+        fee         = gross * (COMM_SELL + TAX_SELL)
+        cash       += gross - fee
+        shares     -= sell_shares
+        return cash, shares, fee
+
+    return cash, shares, 0.0
+
+
+# ─── 交易模擬 ──────────────────────────────────────────────────────────────────
+
+def simulate(days: list[dict]) -> dict:
+    """
+    倉位分級策略模擬。
+    days: [{'date', 'price', 'rec', 'score'}, ...]
+    """
+    n     = len(days)
+    cash  = 1_000_000.0
+    shares = 0.0
+    level = START_LEVEL   # 從 50% 中性倉位開始
+    total_cost = 0.0
+
+    portfolio_arr = np.zeros(n)
+    position_arr  = np.zeros(n)
+    level_arr     = np.zeros(n, dtype=int)
+    rebalance_log: list[dict] = []
+
+    # 第一天：依起始倉位建立初始部位
+    if n > 0:
+        p0 = days[0]['price']
+        cash, shares, cost = rebalance(cash, shares, p0, LEVELS[level])
+        total_cost += cost
+
+    for i, day in enumerate(days):
+        price = day['price']
+
+        # 依前一天的信號調整目標倉位等級（第 0 天用起始等級）
+        if i > 0:
+            prev_rec = days[i - 1]['rec']
+            delta    = LEVEL_DELTA.get(prev_rec, 0)
+            new_level = max(0, min(len(LEVELS) - 1, level + delta))
+
+            if new_level != level:
+                old_pct = LEVELS[level]
+                new_pct = LEVELS[new_level]
+                cash, shares, cost = rebalance(cash, shares, price, new_pct)
+                total_cost += cost
+                rebalance_log.append({
+                    'date':      day['date'],
+                    'signal':    prev_rec,
+                    'old_level': old_pct,
+                    'new_level': new_pct,
+                    'price':     price,
+                    'cost':      cost,
+                })
+                level = new_level
+
+        portfolio_arr[i] = cash + shares * price
+        position_arr[i]  = (shares * price) / portfolio_arr[i] if portfolio_arr[i] > 0 else 0
+        level_arr[i]     = level
+
+    return {
+        'portfolio':     portfolio_arr,
+        'position':      position_arr,
+        'level':         level_arr,
+        'total_cost':    total_cost,
+        'rebalances':    rebalance_log,
+    }
+
+
+# ─── 績效計算 ──────────────────────────────────────────────────────────────────
+
+def calc_metrics(sim: dict, prices: np.ndarray) -> dict:
+    port = sim['portfolio']
+    pos  = sim['position']
+
+    strat_ret = port[-1] / port[0] - 1
+    bah_ret   = prices[-1] / prices[0] - 1
+    alpha     = strat_ret - bah_ret
+    n_years   = len(port) / 252
+    annual    = (1 + strat_ret) ** (1 / n_years) - 1 if n_years > 0 else strat_ret
+
+    bah_port = prices / prices[0] * port[0]
+
+    def max_dd(arr):
+        peak = np.maximum.accumulate(arr)
+        return float(((arr - peak) / peak).min())
+
+    daily = np.diff(port) / port[:-1]
+    sharpe = float(daily.mean() / daily.std() * np.sqrt(252)) if daily.std() > 0 else 0.0
+
+    # 勝率：每筆換倉後到下次換倉期間的報酬
+    rebs = sim['rebalances']
+    seg_rets: list[float] = []
+    if len(rebs) >= 2:
+        for j in range(len(rebs) - 1):
+            r0 = rebs[j]['price']
+            r1 = rebs[j + 1]['price']
+            direction = rebs[j]['new_level'] - rebs[j]['old_level']
+            if direction > 0:               # 加碼後看漲
+                seg_rets.append(r1 / r0 - 1)
+            elif direction < 0:             # 減碼後看跌（減碼對空才算贏）
+                seg_rets.append(r0 / r1 - 1)
+
+    wins     = [r for r in seg_rets if r > 0]
+    win_rate = len(wins) / len(seg_rets) if seg_rets else 0.0
+
+    return {
+        'strat_ret':  strat_ret,
+        'bah_ret':    bah_ret,
+        'alpha':      alpha,
+        'annual':     annual,
+        'max_dd':     max_dd(port),
+        'bah_max_dd': max_dd(bah_port),
+        'sharpe':     sharpe,
+        'n_rebal':    len(rebs),
+        'total_cost': sim['total_cost'],
+        'win_rate':   win_rate,
+        'avg_pos':    float(pos.mean()),
+        'portfolio':  port,
+        'bah_port':   bah_port,
+        'rebalances': rebs,
+    }
+
+
+# ─── 圖表 & 輸出 ───────────────────────────────────────────────────────────────
+
+def _pct(v: float, d: int = 2) -> str:
+    return f"{v*100:>+{d+5}.{d}f}%"
+
+def _sign(v: float) -> str:
+    return '▲' if v > 0 else ('▼' if v < 0 else '─')
+
+
+def print_chart(port: np.ndarray, bah: np.ndarray, pos: np.ndarray, dates: list):
+    W, H = 62, 14
+    n    = len(port)
+    step = max(1, n // W)
+
+    s_raw = (port / port[0] * 100)[::step][:W]
+    b_raw = (bah  / bah[0]  * 100)[::step][:W]
+    p_raw = (pos * 100)[::step][:W]      # 倉位 %
+
+    y_lo  = min(s_raw.min(), b_raw.min()) * 0.98
+    y_hi  = max(s_raw.max(), b_raw.max()) * 1.02
+    rng   = max(y_hi - y_lo, 0.01)
+
+    def row(v):
+        return max(0, min(H - 2, int((y_hi - v) / rng * (H - 2))))
+
+    grid = [[' '] * W for _ in range(H)]
+    # 倉位條（最下兩行）
+    for x in range(min(W, len(p_raw))):
+        pv = p_raw[x]
+        if pv >= 75:   grid[H-1][x] = '▓'
+        elif pv >= 50: grid[H-1][x] = '▒'
+        elif pv >= 25: grid[H-1][x] = '░'
+        else:          grid[H-1][x] = '·'
+
+    for x in range(min(W, len(s_raw))):
+        rb = row(b_raw[x])
+        rs = row(s_raw[x])
+        if 0 <= rb < H-1: grid[rb][x] = '·'
+        if 0 <= rs < H-1:
+            grid[rs][x] = '█' if s_raw[x] >= b_raw[x] else '░'
+
+    print(f"\n  策略走勢 vs 買進持有（基準=100）")
+    print(f"  █/░ 策略   · 買進持有   底部色塊=倉位（▓≥75% ▒≥50% ░≥25%）")
+    print(f"  ┌{'─'*W}┐")
+    for ri, r in enumerate(grid):
+        if ri == H - 1:
+            print(f"  │{''.join(r)}│ 倉%")
+        else:
+            v = y_hi - ri / (H - 2) * rng
+            print(f"  │{''.join(r)}│{v:5.0f}")
+    print(f"  └{'─'*W}┘")
+
+    d0 = pd.Timestamp(dates[0]).strftime('%Y/%m')
+    dm = pd.Timestamp(dates[n // 2]).strftime('%Y/%m')
+    de = pd.Timestamp(dates[-1]).strftime('%Y/%m')
+    pad1 = (W - len(d0) - len(dm)) // 2
+    pad2 = W - len(d0) - pad1 - len(dm) - len(de)
+    print(f"   {d0}{' '*pad1}{dm}{' '*max(0,pad2)}{de}")
+
+
+def print_rebal_log(rebs: list[dict], max_show: int = 15):
+    if not rebs:
+        print("  （無換倉紀錄）")
+        return
+    show = rebs[-max_show:]
+    print(f"\n  {'日期':12} {'信號':6} {'舊倉位':>6} {'新倉位':>6} {'執行價':>8} {'手續費':>8}")
+    print("  " + "─" * 50)
+    for r in show:
+        print(
+            f"  {str(pd.Timestamp(r['date']))[:10]:12}"
+            f" {r['signal']:6}"
+            f" {r['old_level']*100:>5.0f}%"
+            f" → {r['new_level']*100:>4.0f}%"
+            f" {r['price']:>8.1f}"
+            f" {r['cost']:>8.1f}"
+        )
+    if len(rebs) > max_show:
+        print(f"  ...（共 {len(rebs)} 次換倉，僅顯示最後 {max_show} 筆）")
+
+
+def print_monthly(days: list[dict], port: np.ndarray, pos_arr: np.ndarray):
+    df = pd.DataFrame(days)
+    df['portfolio'] = port
+    df['position']  = pos_arr
+    df['month']     = pd.to_datetime([d['date'] for d in days]).to_period('M')
+    df['year']      = df['month'].apply(lambda m: m.year)
+
+    print(f"\n  {'月份':^8}  {'策略':>8}  {'持有':>8}  {'超額':>8}  {'平均倉%':>7}  {'信號分佈':}")
+    print("  " + "─" * 68)
+
+    for month, grp in df.groupby('month'):
+        p_ret = grp['portfolio'].iloc[-1] / grp['portfolio'].iloc[0] - 1
+        s_ret = grp['price'].iloc[-1]     / grp['price'].iloc[0]     - 1
+        alpha = p_ret - s_ret
+        avg_p = grp['position'].mean() * 100
+
+        # Signal distribution this month
+        rc = grp['rec'].value_counts()
+        sig_str = ' '.join(f"{v}:{rc.get(v,0)}" for v in ['強力加碼','加碼','持平','減碼','強力減碼'] if rc.get(v,0)>0)
+
+        star = ' ★' if p_ret > s_ret else '  '
+        print(
+            f"  {str(month):^8}  "
+            f"{_sign(p_ret)}{_pct(p_ret,1):>7}  "
+            f"{_sign(s_ret)}{_pct(s_ret,1):>7}  "
+            f"{_pct(alpha,1):>8}{star}  "
+            f"{avg_p:>5.0f}%  "
+            f"{sig_str}"
+        )
+
+
+def print_yearly(days: list[dict], port: np.ndarray):
+    df = pd.DataFrame(days)
+    df['portfolio'] = port
+    df['year']      = pd.to_datetime([d['date'] for d in days]).year
+
+    print(f"\n  {'年份':^6}  {'策略年報酬':>10}  {'買進持有':>10}  {'超額':>8}")
+    print("  " + "─" * 40)
+    for year, grp in df.groupby('year'):
+        p_ret = grp['portfolio'].iloc[-1] / grp['portfolio'].iloc[0] - 1
+        s_ret = grp['price'].iloc[-1]     / grp['price'].iloc[0]     - 1
+        alpha = p_ret - s_ret
+        star  = ' ★' if p_ret > s_ret else '  '
+        print(
+            f"  {year:^6}  "
+            f"{_sign(p_ret)}{_pct(p_ret,1):>9}  "
+            f"{_sign(s_ret)}{_pct(s_ret,1):>9}  "
+            f"{_pct(alpha,1):>8}{star}"
+        )
+
+
+# ─── 主程式 ────────────────────────────────────────────────────────────────────
+
+def main():
+    symbol = sys.argv[1].upper() if len(sys.argv) > 1 else '2330'
+    W = 68
+
+    print(f"\n{'='*W}")
+    print(f"  {symbol}  3 年 Walk-Forward 回測（倉位加碼/減碼策略）")
+    print(f"  倉位等級：0% / 25% / 50% / 75% / 100%  起始：50%")
+    print(f"  交易成本：買 {COMM_BUY*100:.4f}%  賣 {(COMM_SELL+TAX_SELL)*100:.4f}%")
+    print(f"  * 不含三大法人籌碼（歷史籌碼 API 難以批量回溯）")
+    print(f"{'='*W}")
+
+    # ── 1. 取得數據 ──────────────────────────────────────────────────────────
+    print(f"\n正在下載 {symbol} 3.5 年歷史數據...", flush=True)
+    df_full, ticker = fetch_extended(symbol, years=3.6)
+    df_full = calc_indicators(df_full)
+    all_dates = list(df_full.index)
+    N = len(all_dates)
+
+    # ── 2. 決定 3 年前起始點 ─────────────────────────────────────────────────
+    target_start = datetime.now() - timedelta(days=365 * 3)
+    sim_start = LOOKBACK_DAYS
+    for i, d in enumerate(all_dates):
+        if pd.Timestamp(d) >= pd.Timestamp(target_start):
+            sim_start = max(i, LOOKBACK_DAYS)
+            break
+
+    sim_n = N - sim_start
+    print(f"模擬期間:  {all_dates[sim_start].date()} → {all_dates[-1].date()}")
+    print(f"交易日數:  {sim_n} 天（回測窗口 {LOOKBACK_DAYS} 天）\n")
+
+    # ── 3. Walk-Forward 計算每日信號 ─────────────────────────────────────────
+    print(f"正在計算每日信號（共 {sim_n} 天）...", end='', flush=True)
+    days: list[dict] = []
+    for i in range(sim_start, N):
+        window = df_full.iloc[max(0, i - LOOKBACK_DAYS) : i + 1]
+        price  = float(df_full['Close'].iloc[i])
+        rec, score = get_signal(window)
+        days.append({'date': all_dates[i], 'price': price, 'rec': rec, 'score': score})
+        if (i - sim_start + 1) % 50 == 0:
+            print('.', end='', flush=True)
+    print(' 完成！')
+
+    prices_arr = np.array([d['price'] for d in days])
+
+    # ── 4. 模擬 ──────────────────────────────────────────────────────────────
+    sim = simulate(days)
+    m   = calc_metrics(sim, prices_arr)
+
+    # ── 5. 報告 ──────────────────────────────────────────────────────────────
+
+    # 信號分佈
+    print(f"\n{'─'*W}")
+    print(f"  信號分佈（共 {sim_n} 天）")
+    rec_cnt: dict[str, int] = {}
+    for d in days: rec_cnt[d['rec']] = rec_cnt.get(d['rec'], 0) + 1
+    for lbl in ['強力加碼', '加碼', '持平', '減碼', '強力減碼']:
+        cnt = rec_cnt.get(lbl, 0)
+        pct = cnt / sim_n * 100
+        bar = '█' * max(1, int(pct / 2))
+        print(f"  {lbl:6s}  {cnt:4d}天 ({pct:5.1f}%) {bar}")
+
+    # 績效摘要
+    print(f"\n{'─'*W}")
+    print(f"  績效摘要")
+    print(f"{'─'*W}")
+    arrow = lambda v: '🚀' if v > 0.10 else ('📈' if v > 0 else ('📉' if v < -0.10 else '➡️'))
+    print(f"  策略總報酬:   {_pct(m['strat_ret']):>10}   {arrow(m['strat_ret'])}")
+    print(f"  買進持有報酬: {_pct(m['bah_ret']):>10}")
+    print(f"  超額報酬:     {_pct(m['alpha']):>10}   {'（策略勝）' if m['alpha'] > 0 else '（持有勝）'}")
+    print(f"  年化報酬率:   {_pct(m['annual']):>10}")
+    print(f"  Sharpe Ratio: {m['sharpe']:>10.2f}")
+    print()
+    print(f"  換倉次數:     {m['n_rebal']:>6} 次    總手續費: NT${m['total_cost']:,.0f}")
+    print(f"  平均持倉比:   {m['avg_pos']*100:>6.1f}%")
+    print(f"  策略最大回撤: {_pct(m['max_dd']):>10}   買進持有最大回撤: {_pct(m['bah_max_dd'])}")
+
+    # 走勢圖
+    print_chart(m['portfolio'], m['bah_port'], sim['position'],
+                [d['date'] for d in days])
+
+    # 年度比較
+    print(f"\n{'─'*W}")
+    print("  年度報酬比較  ★ = 策略勝出")
+    print_yearly(days, m['portfolio'])
+
+    # 月份比較
+    print(f"\n{'─'*W}")
+    print("  月份報酬比較  ★ = 策略勝出")
+    print_monthly(days, m['portfolio'], sim['position'])
+
+    # 換倉紀錄
+    print(f"\n{'─'*W}")
+    print("  換倉紀錄（最後 15 筆）")
+    print_rebal_log(m['rebalances'])
+
+    print(f"\n{'='*W}\n")
+
+
+if __name__ == '__main__':
+    main()
