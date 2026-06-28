@@ -59,6 +59,35 @@ LEVEL_DELTA = {
 
 # ─── 數據抓取 ──────────────────────────────────────────────────────────────────
 
+def fetch_twii_regime(years: float = 3.6) -> pd.Series:
+    """
+    Returns a daily Series of regime bonus values indexed by date.
+      TWII / MA200 ≥ 1.05  → +0.25  (強多頭)
+      TWII / MA200 ≥ 1.00  → +0.15  (多頭)
+      TWII / MA200 ≥ 0.95  →  0.00  (中性)
+      TWII / MA200 <  0.95 → -0.15  (空頭)
+    Fetches extra history so MA200 is valid from the start of the sim period.
+    """
+    end   = datetime.now()
+    start = end - timedelta(days=int(years * 365.25) + 250)
+    df = yf.download('^TWII', start=start, end=end, progress=False, auto_adjust=True)
+    if df.empty:
+        return pd.Series(dtype=float)
+    if isinstance(df.columns, pd.MultiIndex):
+        df.columns = df.columns.get_level_values(0)
+    close = df['Close']
+    close.index = pd.to_datetime(close.index).tz_localize(None)
+    ma200 = close.rolling(200).mean()
+    ratio = close / ma200
+    bonus = pd.Series(0.0, index=close.index)
+    bonus[ratio >= 1.05] = 0.25
+    bonus[(ratio >= 1.00) & (ratio < 1.05)] = 0.15
+    bonus[(ratio >= 0.95) & (ratio < 1.00)] = 0.0
+    bonus[ratio < 0.95]  = -0.15
+    bonus[ma200.isna()]  = 0.0   # not enough history yet
+    return bonus
+
+
 def fetch_extended(symbol: str, years: float = 3.5) -> tuple[pd.DataFrame, str]:
     """抓取 years 年的歷史數據。"""
     end   = datetime.now()
@@ -75,13 +104,23 @@ def fetch_extended(symbol: str, years: float = 3.5) -> tuple[pd.DataFrame, str]:
 
 # ─── 信號計算 ──────────────────────────────────────────────────────────────────
 
-def get_signal(window: pd.DataFrame) -> tuple[str, float]:
-    """完全複製 tech_analysis.py 技術面邏輯（不含籌碼面）。"""
+STRONG_BULL_BONUS   = 0.25   # regime bonus value that identifies 強多頭
+BULL_MOVE_THRESH    = 0.02   # 強多頭: only care about 2%+ moves
+BULL_REDUCE         = -0.40  # 強多頭: need stronger evidence to reduce
+BULL_STRONG_REDUCE  = -0.80  # 強多頭: need much stronger evidence to strongly reduce
+BULL_START_LEVEL    = 3      # 強多頭: start at 75% position
+
+
+def get_signal(window: pd.DataFrame, regime_bonus: float = 0.0) -> tuple[str, float]:
+    """完全複製 tech_analysis.py 技術面邏輯（不含籌碼面），含市場多空調整。"""
     if len(window) < MIN_WINDOW:
         return '持平', 0.0
     try:
+        is_strong_bull = (regime_bonus == STRONG_BULL_BONUS)
+        move_thresh    = BULL_MOVE_THRESH if is_strong_bull else MOVE_THRESH
+
         conditions = build_conditions(window)
-        outcomes   = compute_outcomes(window)
+        outcomes   = compute_outcomes(window, move_thresh=move_thresh)
         base       = baseline_stats(outcomes)
         bt         = backtest_conditions(conditions, outcomes, base)
 
@@ -95,12 +134,14 @@ def get_signal(window: pd.DataFrame) -> tuple[str, float]:
             if grp not in group_best or abs(stats['weight']) > abs(group_best[grp]['weight']):
                 group_best[grp] = stats
 
-        score = sum(s['weight'] for s in group_best.values())
+        score          = sum(s['weight'] for s in group_best.values()) + regime_bonus
+        reduce_t       = BULL_REDUCE        if is_strong_bull else -0.25
+        strong_reduce_t = BULL_STRONG_REDUCE if is_strong_bull else -0.60
 
-        if score >= 0.60:   return '強力加碼', score
-        if score >= 0.25:   return '加碼',     score
-        if score <= -0.60:  return '強力減碼', score
-        if score <= -0.25:  return '減碼',     score
+        if score >= 0.60:          return '強力加碼', score
+        if score >= 0.25:          return '加碼',     score
+        if score <= strong_reduce_t: return '強力減碼', score
+        if score <= reduce_t:       return '減碼',     score
         return '持平', score
     except Exception:
         return '持平', 0.0
@@ -144,7 +185,7 @@ def rebalance(
 
 # ─── 交易模擬 ──────────────────────────────────────────────────────────────────
 
-def simulate(days: list[dict]) -> dict:
+def simulate(days: list[dict], start_level: int = START_LEVEL) -> dict:
     """
     倉位分級策略模擬。
     days: [{'date', 'price', 'rec', 'score'}, ...]
@@ -152,7 +193,7 @@ def simulate(days: list[dict]) -> dict:
     n     = len(days)
     cash  = 1_000_000.0
     shares = 0.0
-    level = START_LEVEL   # 從 50% 中性倉位開始
+    level = start_level   # 從指定倉位開始（強多頭用 75%）
     total_cost = 0.0
 
     portfolio_arr = np.zeros(n)
@@ -397,7 +438,7 @@ def main():
 
     print(f"\n{'='*W}")
     print(f"  {symbol}  3 年 Walk-Forward 回測（倉位加碼/減碼策略）")
-    print(f"  倉位等級：0% / 25% / 50% / 75% / 100%  起始：50%")
+    print(f"  倉位等級：0% / 25% / 50% / 75% / 100%  起始：依市場趨勢（強多頭→75% 其他→50%）")
     print(f"  交易成本：買 {COMM_BUY*100:.4f}%  賣 {(COMM_SELL+TAX_SELL)*100:.4f}%")
     print(f"  * 不含三大法人籌碼（歷史籌碼 API 難以批量回溯）")
     print(f"{'='*W}")
@@ -407,6 +448,9 @@ def main():
     df_full, ticker = fetch_extended(symbol, years=3.6)
     df_full = calc_indicators(df_full)
     all_dates = list(df_full.index)
+
+    print(f"正在下載 ^TWII 市場趨勢數據...", flush=True)
+    twii_regime = fetch_twii_regime(years=3.6)
     N = len(all_dates)
 
     # ── 2. 決定 3 年前起始點 ─────────────────────────────────────────────────
@@ -427,8 +471,18 @@ def main():
     for i in range(sim_start, N):
         window = df_full.iloc[max(0, i - LOOKBACK_DAYS) : i + 1]
         price  = float(df_full['Close'].iloc[i])
-        rec, score = get_signal(window)
-        days.append({'date': all_dates[i], 'price': price, 'rec': rec, 'score': score})
+
+        # Look up TWII regime bonus for this date
+        date_ts = pd.Timestamp(all_dates[i]).tz_localize(None)
+        try:
+            regime_bonus = float(twii_regime.asof(date_ts)) if not twii_regime.empty else 0.0
+            if pd.isna(regime_bonus):
+                regime_bonus = 0.0
+        except Exception:
+            regime_bonus = 0.0
+
+        rec, score = get_signal(window, regime_bonus=regime_bonus)
+        days.append({'date': all_dates[i], 'price': price, 'rec': rec, 'score': score, 'regime_bonus': regime_bonus})
         if (i - sim_start + 1) % 50 == 0:
             print('.', end='', flush=True)
     print(' 完成！')
@@ -436,10 +490,26 @@ def main():
     prices_arr = np.array([d['price'] for d in days])
 
     # ── 4. 模擬 ──────────────────────────────────────────────────────────────
-    sim = simulate(days)
+    # Start at 75% if first day is already 強多頭
+    first_bonus = days[0].get('regime_bonus', 0.0) if days else 0.0
+    init_level  = BULL_START_LEVEL if first_bonus == STRONG_BULL_BONUS else START_LEVEL
+    sim = simulate(days, start_level=init_level)
     m   = calc_metrics(sim, prices_arr)
 
     # ── 5. 報告 ──────────────────────────────────────────────────────────────
+
+    # 市場趨勢分佈
+    print(f"\n{'─'*W}")
+    regime_map = {0.25: '強多頭', 0.15: '多頭', 0.0: '中性', -0.15: '空頭'}
+    regime_cnt: dict[str, int] = {}
+    for d in days:
+        label = regime_map.get(d.get('regime_bonus', 0.0), '中性')
+        regime_cnt[label] = regime_cnt.get(label, 0) + 1
+    print(f"  台股趨勢分佈（TWII vs MA200，共 {sim_n} 天）")
+    for lbl in ['強多頭', '多頭', '中性', '空頭']:
+        cnt = regime_cnt.get(lbl, 0)
+        pct = cnt / sim_n * 100
+        print(f"  {lbl:4s}  {cnt:4d}天 ({pct:5.1f}%)")
 
     # 信號分佈
     print(f"\n{'─'*W}")

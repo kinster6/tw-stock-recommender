@@ -238,14 +238,14 @@ def _group_of(name: str) -> str:
     return 'Compound'
 
 
-def compute_outcomes(df: pd.DataFrame) -> pd.Series:
+def compute_outcomes(df: pd.DataFrame, move_thresh: float = MOVE_THRESH) -> pd.Series:
     """5-day forward return label: 1=up, -1=down, 0=flat, NaN=unknown."""
     close = df['Close']
     fwd   = (close.shift(-HORIZON) - close) / close
     out   = pd.Series(np.nan, index=df.index, dtype=float)
-    out[fwd >  MOVE_THRESH] =  1.0
-    out[fwd < -MOVE_THRESH] = -1.0
-    out[(fwd >= -MOVE_THRESH) & (fwd <= MOVE_THRESH)] = 0.0
+    out[fwd >  move_thresh] =  1.0
+    out[fwd < -move_thresh] = -1.0
+    out[(fwd >= -move_thresh) & (fwd <= move_thresh)] = 0.0
     return out
 
 
@@ -572,6 +572,44 @@ def fetch_buffett_indicator() -> dict:
     }
 
 
+def fetch_market_regime() -> dict:
+    """
+    Determine market regime from Taiwan Weighted Index (^TWII) vs its MA200.
+    A bonus is added to the combined score to favour staying long in bull markets
+    and reducing exposure in bear markets.
+
+    Regime table:
+      TWII / MA200 ≥ 1.05  →  強多頭  bonus +0.25
+      TWII / MA200 ≥ 1.00  →  多頭    bonus +0.15
+      TWII / MA200 ≥ 0.95  →  中性    bonus  0.00
+      TWII / MA200 <  0.95 →  空頭    bonus -0.15
+    """
+    try:
+        df = yf.download("^TWII", period="400d", progress=False, auto_adjust=True)
+        if df.empty:
+            return {'regime': '中性', 'bonus': 0.0}
+        if isinstance(df.columns, pd.MultiIndex):
+            df.columns = df.columns.get_level_values(0)
+        close    = df['Close']
+        ma200    = close.rolling(200).mean()
+        current  = float(close.iloc[-1])
+        ma200_v  = float(ma200.iloc[-1])
+        if pd.isna(ma200_v):
+            return {'regime': '中性', 'bonus': 0.0}
+        ratio = current / ma200_v
+        if ratio >= 1.05:
+            regime, bonus = '強多頭', +0.25
+        elif ratio >= 1.00:
+            regime, bonus = '多頭',   +0.15
+        elif ratio >= 0.95:
+            regime, bonus = '中性',    0.00
+        else:
+            regime, bonus = '空頭',   -0.15
+        return {'regime': regime, 'bonus': bonus, 'twii': current, 'ma200': ma200_v, 'ratio': ratio}
+    except Exception:
+        return {'regime': '中性', 'bonus': 0.0}
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # Main analysis
 # ─────────────────────────────────────────────────────────────────────────────
@@ -582,13 +620,18 @@ def analyze(
     df_inst:  pd.DataFrame,
     vix:      dict | None = None,
     buffett:  dict | None = None,
+    regime:   dict | None = None,
 ) -> dict:
     if len(df) < 30:
         raise ValueError("歷史數據不足")
 
     # ── Build conditions & run backtest ─────────────────────────────────────
+    # In 強多頭, use a 2% move threshold to filter noise — only meaningful moves count
+    is_strong_bull = (regime or {}).get('regime') == '強多頭'
+    eff_thresh = 0.02 if is_strong_bull else MOVE_THRESH
+
     conditions = build_conditions(df)
-    outcomes   = compute_outcomes(df)
+    outcomes   = compute_outcomes(df, move_thresh=eff_thresh)
     base       = baseline_stats(outcomes)
     bt         = backtest_conditions(conditions, outcomes, base)
 
@@ -620,16 +663,24 @@ def analyze(
     # Normalize inst_score (-5..+5) to similar scale as tech_score
     inst_normalized = inst_score * 0.12
 
-    combined = tech_score + inst_normalized
+    # ── Market regime adjustment ─────────────────────────────────────────────
+    # TWII vs MA200 adds a bull/bear tilt so the strategy doesn't fight the tape
+    regime_bonus = (regime or {}).get('bonus', 0.0)
+
+    combined = tech_score + inst_normalized + regime_bonus
 
     # ── Recommendation ───────────────────────────────────────────────────────
+    # In 強多頭: raise the bar for reducing — require stronger sell evidence
+    reduce_thresh       = -0.40 if is_strong_bull else -0.25
+    strong_reduce_thresh = -0.80 if is_strong_bull else -0.60
+
     if combined >= 0.6:
         recommendation = "強力加碼"
     elif combined >= 0.25:
         recommendation = "加碼"
-    elif combined <= -0.6:
+    elif combined <= strong_reduce_thresh:
         recommendation = "強力減碼"
-    elif combined <= -0.25:
+    elif combined <= reduce_thresh:
         recommendation = "減碼"
     else:
         recommendation = "持平"
@@ -659,6 +710,8 @@ def analyze(
         'BIAS5': _s('BIAS5'), 'BIAS20': _s('BIAS20'), 'BIAS60': _s('BIAS60'),
         'vix':            vix or {},
         'buffett':        buffett or {},
+        'regime':         regime or {},
+        'regime_bonus':   regime_bonus,
         'base':           base,
         'active_bt':      active_bt,
         'group_best':     group_best,
@@ -722,9 +775,14 @@ def fmt_report(r: dict) -> str:
     # ── Global market indicators ──────────────────────────────────────────────
     vix     = r.get('vix',     {})
     buffett = r.get('buffett', {})
-    if vix or buffett:
+    regime  = r.get('regime',  {})
+    if vix or buffett or regime:
         lines.append("-" * W)
         lines.append("  總體市場指標:")
+        if regime:
+            twii_str = f"TWII {regime['twii']:.0f} / MA200 {regime['ma200']:.0f}" if regime.get('twii') else ""
+            bonus_str = f"  分數調整 {regime['bonus']:+.2f}" if regime.get('bonus') is not None else ""
+            lines.append(f"    台股趨勢: {twii_str}  [{regime['regime']}]{bonus_str}")
         if vix:
             lines.append(
                 f"    恐慌指數(VIX): {vix['value']:.1f}  "
@@ -821,10 +879,13 @@ def fmt_report(r: dict) -> str:
 
     # ── Verdict ───────────────────────────────────────────────────────────────
     lines.append("-" * W)
+    reg_bonus = r.get('regime_bonus', 0.0)
+    reg_name  = r.get('regime', {}).get('regime', '')
+    reg_str   = f"  市場{reg_name}({reg_bonus:+.2f})" if reg_bonus != 0 else ""
     lines.append(
         f"  技術分數: {r['tech_score']:+.3f}  "
-        f"籌碼分數: {r['inst_score']:+d}(×0.12={r['inst_score']*0.12:+.2f})  "
-        f"合計: {r['combined']:+.3f}"
+        f"籌碼分數: {r['inst_score']:+d}(×0.12={r['inst_score']*0.12:+.2f})"
+        f"{reg_str}  合計: {r['combined']:+.3f}"
     )
     rec  = r['recommendation']
     icon = {"強力加碼": "🚀", "加碼": "↑", "持平": "→", "減碼": "↓", "強力減碼": "⚠"}.get(rec, "")
@@ -843,9 +904,10 @@ def main():
         print("範例: python3 tech_analysis.py 2330 2317 0050")
         sys.exit(1)
 
-    print("正在抓取總體市場指標 (VIX / 巴菲特指標)...")
+    print("正在抓取總體市場指標 (VIX / 巴菲特指標 / 台股趨勢)...")
     vix     = fetch_vix()
     buffett = fetch_buffett_indicator()
+    regime  = fetch_market_regime()
 
     for sym in sys.argv[1:]:
         sym = sym.strip().upper()
@@ -859,7 +921,7 @@ def main():
             print(f"正在抓取 {sym} 三大法人數據...")
             df_inst = fetch_institutional(sym, is_otc=is_otc)
 
-            result = analyze(df, sym, df_inst, vix=vix, buffett=buffett)
+            result = analyze(df, sym, df_inst, vix=vix, buffett=buffett, regime=regime)
             result['company_name'] = company_name
             print(fmt_report(result))
         except Exception as e:
