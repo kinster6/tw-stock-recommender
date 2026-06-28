@@ -15,7 +15,7 @@ import numpy as np
 import yfinance as yf
 import requests
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from ta.momentum import StochasticOscillator, RSIIndicator
+from ta.momentum import RSIIndicator  # kept for fallback
 from ta.trend import MACD, SMAIndicator
 from datetime import datetime, timedelta
 
@@ -24,15 +24,45 @@ from datetime import datetime, timedelta
 # Data fetching
 # ─────────────────────────────────────────────────────────────────────────────
 
+_COMPANY_CACHE: dict[str, str] = {}  # symbol → 公司簡稱
+
+def _load_company_cache() -> None:
+    """Populate _COMPANY_CACHE from TWSE OpenAPI (all listed companies, one call)."""
+    if _COMPANY_CACHE:
+        return
+    try:
+        r = requests.get(
+            'https://openapi.twse.com.tw/v1/opendata/t187ap03_L',
+            headers=_TWSE_HDR, timeout=10,
+        )
+        for row in r.json():
+            code  = str(row.get('公司代號', '')).strip()
+            short = str(row.get('公司簡稱', '')).strip()
+            if code and short:
+                _COMPANY_CACHE[code] = short
+    except Exception:
+        pass
+
+
+def fetch_company_name(symbol: str, is_otc: bool = False) -> str:
+    """Return the Chinese short name for a stock code, or '' if not found."""
+    _load_company_cache()
+    return _COMPANY_CACHE.get(symbol, '')
+
+
 def fetch_price_data(symbol: str) -> tuple[pd.DataFrame, str]:
     end   = datetime.now()
-    start = end - timedelta(days=270)
+    start = end - timedelta(days=400)  # ~285 trading days, enough for MA200
     for suffix in [".TW", ".TWO"]:
         ticker = f"{symbol}{suffix}"
-        df = yf.download(ticker, start=start, end=end, progress=False, auto_adjust=True)
+        df = yf.download(ticker, start=start, end=end, progress=False, auto_adjust=False)
         if not df.empty:
             if isinstance(df.columns, pd.MultiIndex):
                 df.columns = df.columns.get_level_values(0)
+            # Use unadjusted prices (match Taiwan stock app behavior)
+            for col in ['Open', 'High', 'Low', 'Close']:
+                if col not in df.columns and f'{col}' in df.columns:
+                    pass
             return df, ticker
     raise ValueError(f"找不到股票 {symbol} 的數據")
 
@@ -49,16 +79,34 @@ def calc_indicators(df: pd.DataFrame) -> pd.DataFrame:
             if len(df) >= period else np.nan
         )
 
-    stoch = StochasticOscillator(high, low, close, window=9, smooth_window=3)
-    df['K'] = stoch.stoch()
-    df['D'] = stoch.stoch_signal()
+    for period in [5, 20, 60]:
+        ma_col = f'MA{period}'
+        if not df[ma_col].isna().all():
+            df[f'BIAS{period}'] = (close - df[ma_col]) / df[ma_col] * 100
+
+    # Taiwan KD: RSV(9) with 1/3 EMA smoothing, initial K=D=50
+    _low9  = low.rolling(9).min()
+    _high9 = high.rolling(9).max()
+    _rsv   = ((close - _low9) / (_high9 - _low9) * 100).fillna(50)
+    _k, _d = 50.0, 50.0
+    _ks, _ds = [], []
+    for v in _rsv:
+        _k = _k * (2/3) + v * (1/3)
+        _d = _d * (2/3) + _k * (1/3)
+        _ks.append(_k); _ds.append(_d)
+    df['K'] = pd.Series(_ks, index=df.index)
+    df['D'] = pd.Series(_ds, index=df.index)
 
     macd_obj = MACD(close, window_slow=26, window_fast=12, window_sign=9)
     df['MACD']        = macd_obj.macd()
     df['MACD_Signal'] = macd_obj.macd_signal()
     df['MACD_Hist']   = macd_obj.macd_diff()
 
-    df['RSI']      = RSIIndicator(close, window=14).rsi()
+    # SMA-based RSI (Cutler's RSI) — matches Taiwan stock app behavior
+    _delta = close.diff()
+    _gain  = _delta.clip(lower=0).rolling(14).mean()
+    _loss  = (-_delta.clip(upper=0)).rolling(14).mean()
+    df['RSI'] = 100 - (100 / (1 + _gain / _loss))
     df['Vol_MA20'] = vol.rolling(20).mean()
     df['Ret1']     = close.pct_change()     # daily return
 
@@ -146,6 +194,16 @@ def build_conditions(df: pd.DataFrame) -> dict[str, pd.Series]:
     conds['縮量上漲'] = (vol < vma * 0.7) & (ret1 > 0)
     conds['縮量下跌'] = (vol < vma * 0.7) & (ret1 < 0)
 
+    # ── BIAS (乖離率) ─────────────────────────────────────────────────────────
+    for _period, _hi in [(5, 5), (20, 10), (60, 15)]:
+        _bcol = f'BIAS{_period}'
+        if _bcol in df.columns:
+            _b = df[_bcol]
+            conds[f'BIAS{_period}偏高(>{_hi}%)']     = _b >  _hi
+            conds[f'BIAS{_period}偏低(<-{_hi}%)']    = _b < -_hi
+            conds[f'BIAS{_period}極高(>{_hi*2}%)']   = _b >  _hi * 2
+            conds[f'BIAS{_period}極低(<-{_hi*2}%)']  = _b < -_hi * 2
+
     # ── Compound ─────────────────────────────────────────────────────────────
     conds['KD超賣+MACD金叉']  = (k < 30) & _cross_above(macd, msig)
     conds['KD超買+MACD死叉']  = (k > 70) & _cross_below(macd, msig)
@@ -171,6 +229,7 @@ def _group_of(name: str) -> str:
     if name.startswith(('KD', 'K值', 'K低', 'K高')):   return 'KD'
     if name.startswith('MACD'):                          return 'MACD'
     if name.startswith('RSI'):                           return 'RSI'
+    if name.startswith('BIAS'):                            return 'BIAS'
     if '5MA' in name or '5ma' in name.lower():           return 'MA5'
     if '月線' in name or '20MA' in name:                 return 'MA20'
     if '季線' in name or '60MA' in name:                 return 'MA60'
@@ -405,6 +464,115 @@ def analyze_institutional(df_inst: pd.DataFrame) -> tuple[int, list[tuple], dict
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# Global market indicators — VIX & Buffett Indicator
+# ─────────────────────────────────────────────────────────────────────────────
+
+def fetch_vix() -> dict:
+    """Fetch CBOE VIX fear index from Yahoo Finance."""
+    try:
+        df = yf.download("^VIX", period="5d", progress=False, auto_adjust=True)
+        if df.empty:
+            return {}
+        if isinstance(df.columns, pd.MultiIndex):
+            df.columns = df.columns.get_level_values(0)
+        val = float(df['Close'].iloc[-1])
+        if val < 15:
+            level, desc = "極度貪婪", "市場情緒極度樂觀，恐慌指數極低"
+        elif val < 20:
+            level, desc = "樂觀", "市場情緒良好，波動率偏低"
+        elif val < 25:
+            level, desc = "中性", "市場波動率適中"
+        elif val < 30:
+            level, desc = "謹慎", "市場不確定性上升，注意風險"
+        elif val < 40:
+            level, desc = "恐慌", "市場恐慌情緒，歷史上常現買點"
+        else:
+            level, desc = "極度恐慌", "市場極度恐慌，可能是逢低布局機會"
+        return {'value': val, 'level': level, 'desc': desc}
+    except Exception:
+        return {}
+
+
+def fetch_buffett_indicator() -> dict:
+    """
+    Taiwan Buffett Indicator = 台灣上市市值 / 台灣GDP
+    GDP: DGBAS 2023 (NT$ billion); market cap fetched live from TWSE or estimated via ^TWII.
+    """
+    TAIWAN_GDP_BN = 23_599  # NT$ billion (2023, DGBAS 行政院主計總處)
+    GDP_YEAR      = 2023
+
+    market_cap_bn = None
+    note = ""
+
+    # Attempt 1: TWSE MI_INDEX market summary
+    try:
+        r = requests.get(
+            'https://www.twse.com.tw/rwd/zh/afterTrading/MI_INDEX',
+            params={'response': 'json', 'type': 'MS'},
+            headers=_TWSE_HDR,
+            timeout=10,
+        )
+        data = r.json()
+        for row in data.get('data', []):
+            if isinstance(row, list):
+                row_text = ' '.join(str(c) for c in row)
+                if '總市值' in row_text or '上市市值' in row_text:
+                    for cell in reversed(row):
+                        try:
+                            val = float(str(cell).replace(',', ''))
+                            if val > 1_000_000:  # 億元 level
+                                market_cap_bn = val / 10  # 億 → billion NT$
+                                note = "TWSE實時"
+                                break
+                        except ValueError:
+                            continue
+                if market_cap_bn:
+                    break
+    except Exception:
+        pass
+
+    # Attempt 2: estimate from ^TWII index value
+    if market_cap_bn is None:
+        try:
+            twii = yf.download("^TWII", period="5d", progress=False, auto_adjust=True)
+            if not twii.empty:
+                if isinstance(twii.columns, pd.MultiIndex):
+                    twii.columns = twii.columns.get_level_values(0)
+                idx = float(twii['Close'].iloc[-1])
+                # Empirical: TWII ≈ 18000 ↔ market cap ≈ NT$54T → coefficient ≈ 3.0 billion/point
+                market_cap_bn = idx * 3.0
+                note = f"估算(加權指數{idx:.0f}點)"
+        except Exception:
+            pass
+
+    if market_cap_bn is None:
+        return {}
+
+    ratio = market_cap_bn / TAIWAN_GDP_BN * 100
+
+    if ratio < 80:
+        level, desc = "嚴重低估", "台股估值極低，長線布局機會"
+    elif ratio < 120:
+        level, desc = "合理", "台股估值處於合理區間"
+    elif ratio < 160:
+        level, desc = "略偏高", "台股估值略偏高，宜審慎操作"
+    elif ratio < 200:
+        level, desc = "偏高", "台股估值偏高，注意風險控管"
+    else:
+        level, desc = "高估", "台股估值明顯過高，系統性風險較大"
+
+    return {
+        'ratio':         ratio,
+        'market_cap_bn': market_cap_bn,
+        'gdp_bn':        TAIWAN_GDP_BN,
+        'gdp_year':      GDP_YEAR,
+        'level':         level,
+        'desc':          desc,
+        'note':          note,
+    }
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # Main analysis
 # ─────────────────────────────────────────────────────────────────────────────
 
@@ -412,6 +580,8 @@ def analyze(
     df:       pd.DataFrame,
     symbol:   str,
     df_inst:  pd.DataFrame,
+    vix:      dict | None = None,
+    buffett:  dict | None = None,
 ) -> dict:
     if len(df) < 30:
         raise ValueError("歷史數據不足")
@@ -466,6 +636,8 @@ def analyze(
 
     # ── Snapshot values ──────────────────────────────────────────────────────
     def _s(col):
+        if col not in df.columns:
+            return None
         v = df[col].iloc[-1]
         return None if pd.isna(v) else float(v)
 
@@ -484,6 +656,9 @@ def analyze(
         'MACD_Signal':    _s('MACD_Signal'),
         'MA5':  _s('MA5'),  'MA20': _s('MA20'),
         'MA60': _s('MA60'), 'MA200': _s('MA200'),
+        'BIAS5': _s('BIAS5'), 'BIAS20': _s('BIAS20'), 'BIAS60': _s('BIAS60'),
+        'vix':            vix or {},
+        'buffett':        buffett or {},
         'base':           base,
         'active_bt':      active_bt,
         'group_best':     group_best,
@@ -520,7 +695,8 @@ def fmt_report(r: dict) -> str:
         return f"{x:{fmt}}" if x is not None else "N/A"
 
     lines.append("=" * W)
-    lines.append(f"  股票代號: {r['symbol']}")
+    name_str = f"  {r['company_name']}" if r.get('company_name') else ""
+    lines.append(f"  股票代號: {r['symbol']}{name_str}")
     chg = f"  ({r['price_chg']:+.2f}, {r['price_pct']:+.2f}%)" if r['price_chg'] else ""
     lines.append(f"  最新收盤: {_v(r['price'])}{chg}")
 
@@ -535,6 +711,36 @@ def fmt_report(r: dict) -> str:
         if r[key] is not None:
             ma_parts.append(f"{lbl}={_v(r[key])}")
     lines.append(f"    均線: {'  '.join(ma_parts)}")
+    bias_parts = []
+    for key, lbl in [('BIAS5','5日'),('BIAS20','20日'),('BIAS60','60日')]:
+        v = r.get(key)
+        if v is not None:
+            bias_parts.append(f"{lbl}={v:+.1f}%")
+    if bias_parts:
+        lines.append(f"    乖離率: {'  '.join(bias_parts)}")
+
+    # ── Global market indicators ──────────────────────────────────────────────
+    vix     = r.get('vix',     {})
+    buffett = r.get('buffett', {})
+    if vix or buffett:
+        lines.append("-" * W)
+        lines.append("  總體市場指標:")
+        if vix:
+            lines.append(
+                f"    恐慌指數(VIX): {vix['value']:.1f}  "
+                f"[{vix['level']}]  {vix['desc']}"
+            )
+        if buffett:
+            cap_t  = buffett['market_cap_bn'] / 1_000
+            gdp_t  = buffett['gdp_bn']        / 1_000
+            lines.append(
+                f"    巴菲特指標:  {buffett['ratio']:.1f}%"
+                f"  (市值{cap_t:.1f}兆 / GDP{gdp_t:.1f}兆 {buffett['gdp_year']})"
+                f"  [{buffett['level']}]"
+            )
+            note = buffett.get('note', '')
+            suffix = f"  ({note})" if note else ""
+            lines.append(f"    {buffett['desc']}{suffix}")
 
     # ── Institutional snapshot ────────────────────────────────────────────────
     inst = r.get('inst_summary', {})
@@ -637,6 +843,10 @@ def main():
         print("範例: python3 tech_analysis.py 2330 2317 0050")
         sys.exit(1)
 
+    print("正在抓取總體市場指標 (VIX / 巴菲特指標)...")
+    vix     = fetch_vix()
+    buffett = fetch_buffett_indicator()
+
     for sym in sys.argv[1:]:
         sym = sym.strip().upper()
         try:
@@ -645,10 +855,12 @@ def main():
             is_otc = ticker.endswith('.TWO')
             df = calc_indicators(df)
 
+            company_name = fetch_company_name(sym, is_otc=is_otc)
             print(f"正在抓取 {sym} 三大法人數據...")
             df_inst = fetch_institutional(sym, is_otc=is_otc)
 
-            result = analyze(df, sym, df_inst)
+            result = analyze(df, sym, df_inst, vix=vix, buffett=buffett)
+            result['company_name'] = company_name
             print(fmt_report(result))
         except Exception as e:
             import traceback
