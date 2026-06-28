@@ -61,16 +61,24 @@ For each stock, the skill:
 ### Installation
 
 1. Clone this repository
-2. Install dependencies: `pip install -r requirements.txt`
-3. The `.claude/commands/stock-analysis.md` file is picked up automatically by Claude Code
+2. Open the folder in Claude Code — the `/stock-analysis` command is immediately available
+3. Install Python dependencies by typing this directly in Claude Code:
+
+```
+! pip install -r requirements.txt
+```
+
+That's it. Type `/stock-analysis 2330` to run your first analysis.
+
+> **Tip**: The `!` prefix lets you run shell commands without leaving Claude Code.
+
+Or install manually from your terminal:
 
 ```bash
-git clone https://github.com/your-username/stock-recommender.git
+git clone https://github.com/kinster6/stock-recommender.git
 cd stock-recommender
 pip install -r requirements.txt
 ```
-
-Then open the folder in Claude Code and type `/stock-analysis 2330`.
 
 ### Notes
 
