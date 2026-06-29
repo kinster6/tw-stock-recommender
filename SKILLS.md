@@ -93,4 +93,14 @@ pip install -r requirements.txt
 - The script automatically tries `.TW` (TWSE) then `.TWO` (TPEx)
 - All signals are stock-specific — the same pattern can be bullish for one stock and bearish for another
 - These are technical signals only; always consider fundamentals and personal risk tolerance
-- Disclaimer: Not financial advice
+
+### Disclaimer / 免責聲明
+
+> **本工具僅供學術研究與個人參考使用，不構成任何投資建議、要約或邀約。**
+> All analysis results are based on historical technical data. Past performance does not guarantee future results.
+> The tool does not account for individual financial conditions, investment objectives, or risk tolerance.
+> Users bear full responsibility for all investment decisions. The authors accept no liability for any losses arising from use of this tool.
+> Data is sourced from public APIs (Yahoo Finance, TWSE, TPEx) and accuracy is not guaranteed.
+> This tool does not hold a securities investment advisory license (證券投資顧問執照). Do not use analysis results as the sole basis for trading decisions.
+>
+> **投資人應自行研究，並在必要時諮詢合格之證券投資顧問。**
