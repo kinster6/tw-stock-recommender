@@ -6,6 +6,8 @@ actual historical hit rate over the past 6 months for the specific stock.
 """
 
 from __future__ import annotations
+import json
+import re
 import sys
 import warnings
 warnings.filterwarnings('ignore')
@@ -15,6 +17,7 @@ import numpy as np
 import yfinance as yf
 import requests
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from pathlib import Path
 from ta.momentum import RSIIndicator  # kept for fallback
 from ta.trend import MACD, SMAIndicator
 from datetime import datetime, timedelta
@@ -611,6 +614,214 @@ def fetch_market_regime() -> dict:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# Futures positioning (外資臺股期貨淨部位) — market-wide macro overlay
+# ─────────────────────────────────────────────────────────────────────────────
+# ponytail: TAIFEX only serves single-date queries and fronts them with Cloudflare
+# rate-limiting — no bulk history download exists. So we cache one date per run
+# and let the sample accumulate naturally over repeated invocations instead of
+# ever bulk-scraping. Below FUTURES_MIN_SAMPLES the signal contributes 0.
+
+FUTURES_CACHE_FILE  = Path(__file__).parent / "taifex_net_pos_cache.json"
+FUTURES_MIN_SAMPLES = 12  # need >=3 per quartile bucket before trusting it at all
+
+
+def _load_futures_cache() -> dict[str, float]:
+    if FUTURES_CACHE_FILE.exists():
+        try:
+            return json.loads(FUTURES_CACHE_FILE.read_text())
+        except (json.JSONDecodeError, OSError):
+            return {}
+    return {}
+
+
+def _save_futures_cache(cache: dict[str, float]) -> None:
+    try:
+        FUTURES_CACHE_FILE.write_text(json.dumps(cache, ensure_ascii=False, indent=0))
+    except OSError:
+        pass
+
+
+def fetch_futures_net_position(date_str: str) -> tuple[float | None, float | None]:
+    """
+    POST TAIFEX 三大法人-依日期查詢 for TXF (臺股期貨), return (外資未平倉淨部位口數,
+    外資未平倉空方口數) — both come off the same row of the same response, so
+    capturing the second costs nothing extra.
+    Single request, no retries — a 429/Cloudflare block or a non-trading day both
+    just mean "no data today", handled the same as any other missing day.
+    """
+    try:
+        r = requests.post(
+            "https://www.taifex.com.tw/cht/3/futContractsDate",
+            data={"queryType": "1", "queryDate": date_str, "commodityId": "TXF"},
+            headers={"User-Agent": "Mozilla/5.0"},
+            timeout=15,
+        )
+    except requests.RequestException:
+        return None, None
+    if r.status_code == 429 or "Just a moment" in r.text:
+        return None, None
+
+    html = r.text
+    table_start = html.find("table_f")
+    idx = html.find("外資", table_start if table_start != -1 else 0)
+    if idx == -1:
+        return None, None
+    block = html[idx: idx + 3000]
+    text  = re.sub(r"<[^>]+>", " ", block)
+    nums  = re.findall(r"-?[\d][\d,]*", text)
+    if len(nums) < 11:
+        return None, None
+    # Row layout: [多方口數,多方金額,空方口數,空方金額,多空淨額口數(交易),多空淨額金額(交易),
+    #  多方口數(未平倉,idx6),多方金額,空方口數(未平倉,idx8),空方金額,多空淨額口數(未平倉,idx10),多空淨額金額]
+    try:
+        short_oi = float(nums[8].replace(",", ""))
+    except ValueError:
+        short_oi = None
+    try:
+        net_pos = float(nums[10].replace(",", ""))
+    except ValueError:
+        net_pos = None
+    return net_pos, short_oi
+
+
+def _quartile_excess_bonus(values: pd.Series, close: pd.Series, today_val: float) -> dict:
+    """
+    Shared scoring core for a market-wide macro series: bucket `values` (date-
+    indexed) into quartiles and score today's bucket by excess edge vs TWII's own
+    baseline — same methodology as backtest_conditions(), confidence-weighted by
+    sample size, halved because it applies identically to every stock in a batch.
+    """
+    df = pd.DataFrame({'val': values}).join(close.rename('close'), how='inner')
+    if len(df) < FUTURES_MIN_SAMPLES:
+        return {'bonus': 0.0, 'bucket': None, 'note': f"樣本僅 {len(df)} 天，未達 {FUTURES_MIN_SAMPLES} 天門檻，暫不計分"}
+
+    fwd     = (df['close'].shift(-HORIZON) - df['close']) / df['close']
+    outcome = pd.Series(np.nan, index=df.index)
+    outcome[fwd >  MOVE_THRESH] =  1.0
+    outcome[fwd < -MOVE_THRESH] = -1.0
+    outcome[(fwd >= -MOVE_THRESH) & (fwd <= MOVE_THRESH)] = 0.0
+    known = df.assign(outcome=outcome).dropna(subset=['outcome'])
+    if len(known) < FUTURES_MIN_SAMPLES:
+        return {'bonus': 0.0, 'bucket': None, 'note': f"已知結果樣本僅 {len(known)} 天，暫不計分"}
+
+    base_edge = float((known['outcome'] == 1).mean() - (known['outcome'] == -1).mean())
+    try:
+        known = known.copy()
+        known['quartile'] = pd.qcut(known['val'], 4, duplicates='drop')
+    except ValueError:
+        return {'bonus': 0.0, 'bucket': None, 'note': "數值變化不足以分組，暫不計分"}
+
+    bucket = None
+    for interval in known['quartile'].cat.categories:
+        if today_val in interval or today_val == interval.right:
+            bucket = interval
+            break
+    if bucket is None:
+        # today's value sits outside the historical range entirely — extrapolating
+        # off the last known bucket would overstate confidence, so skip scoring.
+        return {'bonus': 0.0, 'bucket': None, 'note': "今日數值超出歷史分組範圍，暫不計分"}
+
+    sub  = known[known['quartile'] == bucket]
+    n    = len(sub)
+    up   = float((sub['outcome'] == 1).mean())
+    down = float((sub['outcome'] == -1).mean())
+    excess = (up - down) - base_edge
+    conf   = min(n / 20.0, 1.0)
+    bonus  = excess * conf * 0.5  # halved: shared across every stock in the batch
+
+    return {
+        'bucket':     f"{bucket.left:,.0f} ~ {bucket.right:,.0f}",
+        'bucket_n':   n,
+        'up_rate':    up,
+        'down_rate':  down,
+        'excess':     excess,
+        'confidence': conf,
+        'bonus':      bonus,
+        'note':       f"樣本{n}天 上漲{up:.0%} 下跌{down:.0%}",
+    }
+
+
+def _dated_series(raw: dict[str, float]) -> pd.Series:
+    s = pd.Series(raw)
+    s.index = pd.to_datetime(s.index, format="%Y/%m/%d")
+    return s.sort_index()
+
+
+def fetch_futures_sentiment() -> dict:
+    """
+    Market-wide macro overlay from 外資 TXF 未平倉部位: net position (direction)
+    and gross short open interest (hedging/bearish pressure), each scored
+    independently via _quartile_excess_bonus() and summed into one bonus.
+    """
+    try:
+        twii = yf.download("^TWII", period="200d", progress=False, auto_adjust=True)
+        if twii.empty:
+            return {}
+        if isinstance(twii.columns, pd.MultiIndex):
+            twii.columns = twii.columns.get_level_values(0)
+        close = twii['Close']
+    except Exception:
+        return {}
+
+    latest_date = close.index[-1]
+    date_str    = latest_date.strftime("%Y/%m/%d")
+
+    cache = _load_futures_cache()
+    entry = cache.get(date_str)
+    if not isinstance(entry, dict):  # missing, or legacy plain-float cache format
+        entry = None
+    if entry is None:
+        net_val, short_val = fetch_futures_net_position(date_str)
+        if net_val is not None:
+            entry = {'net': net_val, 'short': short_val}
+            cache[date_str] = entry
+            _save_futures_cache(cache)
+
+    result = {
+        'net_pos':     entry.get('net')   if entry else None,
+        'short_oi':    entry.get('short') if entry else None,
+        'sample_n':    len(cache),
+        'bonus':       0.0,
+        'short_bonus': 0.0,
+        'bucket':      None,
+    }
+    if entry is None:
+        result['note'] = "今日資料無法取得（可能遭 TAIFEX 限速或休市）"
+        return result
+
+    # Tolerate legacy cache entries that were a plain float (net-only, no short).
+    net_raw:   dict[str, float] = {}
+    short_raw: dict[str, float] = {}
+    for d, v in cache.items():
+        if isinstance(v, dict):
+            if v.get('net') is not None:
+                net_raw[d] = v['net']
+            if v.get('short') is not None:
+                short_raw[d] = v['short']
+        elif isinstance(v, (int, float)):
+            net_raw[d] = v
+
+    if result['net_pos'] is not None:
+        r_net = _quartile_excess_bonus(_dated_series(net_raw), close, result['net_pos'])
+        result['bonus']    = r_net['bonus']
+        result['bucket']   = r_net.get('bucket')
+        result['bucket_n'] = r_net.get('bucket_n')
+        result['note']     = r_net['note']
+    else:
+        result['note'] = "無淨部位資料"
+
+    if result['short_oi'] is not None and len(short_raw) >= FUTURES_MIN_SAMPLES:
+        r_short = _quartile_excess_bonus(_dated_series(short_raw), close, result['short_oi'])
+        result['short_bonus']  = r_short['bonus']
+        result['short_bucket'] = r_short.get('bucket')
+        result['short_note']   = r_short['note']
+    else:
+        result['short_note'] = f"空單口數樣本僅 {len(short_raw)} 天，暫不計分"
+
+    return result
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # Main analysis
 # ─────────────────────────────────────────────────────────────────────────────
 
@@ -621,17 +832,23 @@ def analyze(
     vix:      dict | None = None,
     buffett:  dict | None = None,
     regime:   dict | None = None,
+    futures:  dict | None = None,
 ) -> dict:
     if len(df) < 30:
         raise ValueError("歷史數據不足")
 
     # ── Build conditions & run backtest ─────────────────────────────────────
-    # In 強多頭, use a 2% move threshold to filter noise — only meaningful moves count
-    is_strong_bull = (regime or {}).get('regime') == '強多頭'
-    eff_thresh = 0.02 if is_strong_bull else MOVE_THRESH
+    # Per-regime thresholds: bull → hard to reduce; bear → easy to reduce
+    _REGIME_PARAMS: dict[str, dict] = {
+        '強多頭': dict(add=0.25, reduce=-0.40, strong=-0.80, move=0.020),
+        '多頭':   dict(add=0.25, reduce=-0.25, strong=-0.60, move=0.015),
+        '中性':   dict(add=0.25, reduce=-0.25, strong=-0.60, move=0.015),
+        '空頭':   dict(add=0.25, reduce=-0.25, strong=-0.60, move=0.015),
+    }
+    _rp = _REGIME_PARAMS.get((regime or {}).get('regime', '中性'), _REGIME_PARAMS['中性'])
 
     conditions = build_conditions(df)
-    outcomes   = compute_outcomes(df, move_thresh=eff_thresh)
+    outcomes   = compute_outcomes(df, move_thresh=_rp['move'])
     base       = baseline_stats(outcomes)
     bt         = backtest_conditions(conditions, outcomes, base)
 
@@ -667,20 +884,21 @@ def analyze(
     # TWII vs MA200 adds a bull/bear tilt so the strategy doesn't fight the tape
     regime_bonus = (regime or {}).get('bonus', 0.0)
 
-    combined = tech_score + inst_normalized + regime_bonus
+    # ── Futures positioning adjustment ───────────────────────────────────────
+    # 外資 TXF 淨部位 + 空方口數，each bucketed against its own historical excess
+    # edge; 0 until enough cached samples exist (see fetch_futures_sentiment).
+    futures_bonus = (futures or {}).get('bonus', 0.0) + (futures or {}).get('short_bonus', 0.0)
+
+    combined = tech_score + inst_normalized + regime_bonus + futures_bonus
 
     # ── Recommendation ───────────────────────────────────────────────────────
-    # In 強多頭: raise the bar for reducing — require stronger sell evidence
-    reduce_thresh       = -0.40 if is_strong_bull else -0.25
-    strong_reduce_thresh = -0.80 if is_strong_bull else -0.60
-
     if combined >= 0.6:
         recommendation = "強力加碼"
-    elif combined >= 0.25:
+    elif combined >= _rp['add']:
         recommendation = "加碼"
-    elif combined <= strong_reduce_thresh:
+    elif combined <= _rp['strong']:
         recommendation = "強力減碼"
-    elif combined <= reduce_thresh:
+    elif combined <= _rp['reduce']:
         recommendation = "減碼"
     else:
         recommendation = "持平"
@@ -712,6 +930,8 @@ def analyze(
         'buffett':        buffett or {},
         'regime':         regime or {},
         'regime_bonus':   regime_bonus,
+        'futures':        futures or {},
+        'futures_bonus':  futures_bonus,
         'base':           base,
         'active_bt':      active_bt,
         'group_best':     group_best,
@@ -776,7 +996,8 @@ def fmt_report(r: dict) -> str:
     vix     = r.get('vix',     {})
     buffett = r.get('buffett', {})
     regime  = r.get('regime',  {})
-    if vix or buffett or regime:
+    futures = r.get('futures', {})
+    if vix or buffett or regime or futures:
         lines.append("-" * W)
         lines.append("  總體市場指標:")
         if regime:
@@ -799,6 +1020,20 @@ def fmt_report(r: dict) -> str:
             note = buffett.get('note', '')
             suffix = f"  ({note})" if note else ""
             lines.append(f"    {buffett['desc']}{suffix}")
+        if futures:
+            net = futures.get('net_pos')
+            net_str = f"{net:+,.0f}口" if net is not None else "N/A"
+            bonus_str = f"  分數調整 {futures['bonus']:+.2f}" if futures.get('bonus') else ""
+            lines.append(
+                f"    外資期貨淨部位(TXF): {net_str}{bonus_str}  ({futures.get('note', '')})"
+            )
+            short = futures.get('short_oi')
+            if short is not None:
+                short_str = f"{short:+,.0f}口"
+                short_bonus_str = f"  分數調整 {futures['short_bonus']:+.2f}" if futures.get('short_bonus') else ""
+                lines.append(
+                    f"    外資期貨空方口數(TXF): {short_str}{short_bonus_str}  ({futures.get('short_note', '')})"
+                )
 
     # ── Institutional snapshot ────────────────────────────────────────────────
     inst = r.get('inst_summary', {})
@@ -882,10 +1117,12 @@ def fmt_report(r: dict) -> str:
     reg_bonus = r.get('regime_bonus', 0.0)
     reg_name  = r.get('regime', {}).get('regime', '')
     reg_str   = f"  市場{reg_name}({reg_bonus:+.2f})" if reg_bonus != 0 else ""
+    fut_bonus = r.get('futures_bonus', 0.0)
+    fut_str   = f"  期貨籌碼({fut_bonus:+.2f})" if fut_bonus != 0 else ""
     lines.append(
         f"  技術分數: {r['tech_score']:+.3f}  "
         f"籌碼分數: {r['inst_score']:+d}(×0.12={r['inst_score']*0.12:+.2f})"
-        f"{reg_str}  合計: {r['combined']:+.3f}"
+        f"{reg_str}{fut_str}  合計: {r['combined']:+.3f}"
     )
     rec  = r['recommendation']
     icon = {"強力加碼": "🚀", "加碼": "↑", "持平": "→", "減碼": "↓", "強力減碼": "⚠"}.get(rec, "")
@@ -904,10 +1141,11 @@ def main():
         print("範例: python3 tech_analysis.py 2330 2317 0050")
         sys.exit(1)
 
-    print("正在抓取總體市場指標 (VIX / 巴菲特指標 / 台股趨勢)...")
+    print("正在抓取總體市場指標 (VIX / 巴菲特指標 / 台股趨勢 / 外資期貨淨部位)...")
     vix     = fetch_vix()
     buffett = fetch_buffett_indicator()
     regime  = fetch_market_regime()
+    futures = fetch_futures_sentiment()
 
     for sym in sys.argv[1:]:
         sym = sym.strip().upper()
@@ -921,7 +1159,7 @@ def main():
             print(f"正在抓取 {sym} 三大法人數據...")
             df_inst = fetch_institutional(sym, is_otc=is_otc)
 
-            result = analyze(df, sym, df_inst, vix=vix, buffett=buffett, regime=regime)
+            result = analyze(df, sym, df_inst, vix=vix, buffett=buffett, regime=regime, futures=futures)
             result['company_name'] = company_name
             print(fmt_report(result))
         except Exception as e:
