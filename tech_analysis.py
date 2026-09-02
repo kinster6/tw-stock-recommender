@@ -7,6 +7,7 @@ actual historical hit rate over the past 6 months for the specific stock.
 
 from __future__ import annotations
 import json
+import os
 import re
 import sys
 import warnings
@@ -20,7 +21,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from ta.momentum import RSIIndicator  # kept for fallback
 from ta.trend import MACD, SMAIndicator
-from datetime import datetime, timedelta
+from datetime import date, datetime, timedelta
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -68,6 +69,19 @@ def fetch_price_data(symbol: str) -> tuple[pd.DataFrame, str]:
                     pass
             return df, ticker
     raise ValueError(f"找不到股票 {symbol} 的數據")
+
+
+def fetch_stock_earnings_date(ticker: str) -> date | None:
+    """Best-effort: this stock's next earnings date via yfinance, or None if unavailable."""
+    try:
+        cal = yf.Ticker(ticker).calendar
+        dates = (cal or {}).get('Earnings Date')
+        if not dates:
+            return None
+        d = dates[0] if isinstance(dates, list) else dates
+        return d if isinstance(d, date) else None
+    except Exception:
+        return None
 
 
 def calc_indicators(df: pd.DataFrame) -> pd.DataFrame:
@@ -575,6 +589,114 @@ def fetch_buffett_indicator() -> dict:
     }
 
 
+# ─────────────────────────────────────────────────────────────────────────────
+# Macro event calendar — FOMC / PCE / CPI, informational only (no score impact)
+# ─────────────────────────────────────────────────────────────────────────────
+# ponytail: each source is scraped from its official government calendar page
+# (stable table/markup, no ToS issue) and fails silently on its own — one
+# source breaking (page redesign, network hiccup) never blocks the others.
+
+_UA = {"User-Agent": "Mozilla/5.0"}
+
+
+def _parse_month_day(month_day: str, year: int) -> date | None:
+    try:
+        return datetime.strptime(f"{month_day.strip()} {year}", "%B %d %Y").date()
+    except ValueError:
+        return None
+
+
+def _parse_fomc_events(html: str, today: date, horizon: date) -> list[dict]:
+    events = []
+    for year_str, block in re.findall(r'(\d{4}) FOMC Meetings</a></h4>(.*?)(?=<h4>|\Z)', html, re.S):
+        year   = int(year_str)
+        months = re.findall(r'fomc-meeting__month[^"]*"><strong>(\w+)</strong>', block)
+        dates  = re.findall(r'fomc-meeting__date[^"]*">([^<]+)<', block)
+        for month, day_range in zip(months, dates):
+            last_day = re.sub(r'\*', '', day_range).split('-')[-1].strip()
+            d = _parse_month_day(f"{month} {last_day}", year)
+            if d and today <= d <= horizon:
+                events.append({'date': d, 'name': 'FOMC利率決策會議'})
+    return events
+
+
+def _parse_bea_events(html: str, today: date, horizon: date) -> list[dict]:
+    """BEA release schedule covers both PCE ('Personal Income and Outlays') and
+    quarterly GDP estimates (titles starting 'GDP (...)' — excludes the unrelated
+    'GDP by County' regional release, which isn't market-moving)."""
+    events = []
+    year_m = re.search(r'Year (\d{4})', html)
+    year   = int(year_m.group(1)) if year_m else today.year
+    for row in re.findall(r'<tr class="scheduled-releases-type-press">(.*?)</tr>', html, re.S):
+        date_m  = re.search(r'release-date">([^<]+)<', row)
+        title_m = re.search(r'release-title[^>]*>([^<]+)', row)
+        if not date_m or not title_m:
+            continue
+        title = title_m.group(1).strip()
+        if 'Personal Income and Outlays' in title:
+            name = '美國PCE物價指數公布'
+        elif title.startswith('GDP ('):
+            name = '美國GDP公布'
+        else:
+            continue
+        d = _parse_month_day(date_m.group(1), year)
+        if d and today <= d <= horizon:
+            events.append({'date': d, 'name': name})
+    return events
+
+
+def fetch_macro_events(days_ahead: int = 7) -> list[dict]:
+    """Best-effort scrape of upcoming macro events within `days_ahead` days.
+    Each source fails silently and independently — a missing FRED_API_KEY
+    just means CPI is skipped, a federalreserve.gov redesign just means FOMC
+    is skipped, etc.
+    """
+    today   = date.today()
+    horizon = today + timedelta(days=days_ahead)
+    events: list[dict] = []
+
+    try:
+        html = requests.get(
+            "https://www.federalreserve.gov/monetarypolicy/fomccalendars.htm",
+            headers=_UA, timeout=10,
+        ).text
+        events += _parse_fomc_events(html, today, horizon)
+    except Exception:
+        pass
+
+    try:
+        html = requests.get("https://www.bea.gov/news/schedule", headers=_UA, timeout=10).text
+        events += _parse_bea_events(html, today, horizon)
+    except Exception:
+        pass
+
+    api_key = os.environ.get('FRED_API_KEY')
+    if api_key:
+        for release_id, name in [(10, '美國CPI公布'), (50, '美國非農就業報告(NFP)')]:
+            try:
+                resp = requests.get(
+                    "https://api.stlouisfed.org/fred/release/dates",
+                    params={
+                        'release_id': release_id,
+                        'api_key': api_key,
+                        'file_type': 'json',
+                        'realtime_start': today.isoformat(),
+                        'realtime_end': horizon.isoformat(),
+                        'include_release_dates_with_no_data': 'false',
+                    },
+                    timeout=10,
+                ).json()
+                for rd in resp.get('release_dates', []):
+                    d = datetime.strptime(rd['date'], '%Y-%m-%d').date()
+                    if today <= d <= horizon:
+                        events.append({'date': d, 'name': name})
+            except Exception:
+                pass
+
+    events.sort(key=lambda e: e['date'])
+    return events
+
+
 def fetch_market_regime() -> dict:
     """
     Determine market regime from Taiwan Weighted Index (^TWII) vs its MA200.
@@ -972,6 +1094,9 @@ def fmt_report(r: dict) -> str:
     lines.append(f"  股票代號: {r['symbol']}{name_str}")
     chg = f"  ({r['price_chg']:+.2f}, {r['price_pct']:+.2f}%)" if r['price_chg'] else ""
     lines.append(f"  最新收盤: {_v(r['price'])}{chg}")
+    ed = r.get('earnings_date')
+    if ed and date.today() <= ed <= date.today() + timedelta(days=7):
+        lines.append(f"  ⚠ 財報將於 {ed.strftime('%-m/%-d')} 公布，財報前後波動放大，建議觀望")
 
     # ── Indicator snapshot ────────────────────────────────────────────────────
     lines.append("-" * W)
@@ -1146,6 +1271,10 @@ def main():
     buffett = fetch_buffett_indicator()
     regime  = fetch_market_regime()
     futures = fetch_futures_sentiment()
+    macro_events = fetch_macro_events()
+    if macro_events:
+        ev_str = "、".join(f"{e['date'].strftime('%-m/%-d')} {e['name']}" for e in macro_events)
+        print(f"⚠ 重大事件提醒（未來7天）：{ev_str}")
 
     for sym in sys.argv[1:]:
         sym = sym.strip().upper()
@@ -1161,6 +1290,7 @@ def main():
 
             result = analyze(df, sym, df_inst, vix=vix, buffett=buffett, regime=regime, futures=futures)
             result['company_name'] = company_name
+            result['earnings_date'] = fetch_stock_earnings_date(ticker)
             print(fmt_report(result))
         except Exception as e:
             import traceback
