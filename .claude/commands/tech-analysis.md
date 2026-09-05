@@ -28,8 +28,7 @@ Run data-driven technical analysis on one or more Taiwan stock symbols and outpu
    - Whether institutional flow aligns or diverges from the technical picture
    - Overall risk/reward and position-sizing suggestion for the coming week
 
-4. If multiple stocks: end with a comparison table
-   `股票 | 公司名 | 收盤價 | 技術分 | 籌碼分 | 市場趨勢 | 合計 | 建議`
+4. If multiple stocks: the script itself prints a `綜合比較表` at the end, pre-sorted 強力加碼 → 加碼 → 持平 → 減碼 → 強力減碼 (ties broken by combined score, descending). Present it as-is — no need to rebuild it by hand.
 
 ## Scoring
 

@@ -8,6 +8,12 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 # Install dependencies
 pip install -r requirements.txt
 
+# Load FRED_API_KEY (needed for CPI/NFP in the macro-event banner) — .env is
+# gitignored, never commit it. Source it once per shell session before running
+# any script below; without it, CPI/NFP are silently skipped (FOMC/PCE/GDP
+# don't need a key and always work).
+source .env
+
 # Run technical analysis on one or more Taiwan stock codes
 python3 tech_analysis.py 2330
 python3 tech_analysis.py 2330 2317 0050
@@ -23,10 +29,11 @@ python3 news.py 2330
 # Run 3-year walk-forward backtest for a stock
 python3 backtest_annual.py 2330
 
-# Self-checks for the macro-event, fundamentals, and news HTML/regex parsers
+# Self-checks for the macro-event, fundamentals, news, and summary-table sort logic
 python3 test_macro_events.py
 python3 test_fundamentals.py
 python3 test_news.py
+python3 test_tech_analysis.py
 ```
 
 No build step — `test_*.py` are lightweight assert-based self-checks for parsing logic only (see "Self-checks" below), not a full test suite. Primary validation is still running the scripts directly and observing output.
@@ -49,7 +56,7 @@ Data flows in this order:
 
 5. **Score** — `analyze()` aggregates: technical score (sum of excess margins weighted by confidence) + institutional score (fixed rules: foreign/trust consecutive buys/sells) × 0.12 + market regime adjustment (+0.25 in 強多頭, down to -0.15 in 空頭). Thresholds: ≥+0.60 強力加碼, ≥+0.25 加碼, ≤-0.25 減碼 (≤-0.40 in 強多頭), ≤-0.60 強力減碼 (≤-0.80 in 強多頭).
 
-6. **Output** — `fmt_report()` formats the full report including indicator snapshot, institutional breakdown, condition backtest table, and final recommendation.
+6. **Output** — `fmt_report()` formats the full report including indicator snapshot, institutional breakdown, condition backtest table, and final recommendation. When multiple symbols are passed, `main()` also prints `fmt_summary_table()` at the end — a comparison table pre-sorted 強力加碼 → 加碼 → 持平 → 減碼 → 強力減碼 (ties broken by combined score, descending), via the shared `_REC_RANK`/`_REC_ICON` constants.
 
 `fetch_macro_events()` is a separate, informational-only overlay: scrapes FOMC (federalreserve.gov), PCE/GDP (bea.gov), and — if `FRED_API_KEY` is set — CPI/NFP (FRED API) for events in the next 7 days, printed once as a warning banner before the per-stock loop. `fetch_stock_earnings_date()` does the same per-stock via yfinance's earnings calendar. Neither affects scoring.
 

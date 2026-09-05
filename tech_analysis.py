@@ -682,7 +682,9 @@ def fetch_macro_events(days_ahead: int = 7) -> list[dict]:
                         'file_type': 'json',
                         'realtime_start': today.isoformat(),
                         'realtime_end': horizon.isoformat(),
-                        'include_release_dates_with_no_data': 'false',
+                        # Upcoming releases have no data yet by definition —
+                        # 'false' here silently strips every future date.
+                        'include_release_dates_with_no_data': 'true',
                     },
                     timeout=10,
                 ).json()
@@ -1071,6 +1073,10 @@ def analyze(
 # Report formatting
 # ─────────────────────────────────────────────────────────────────────────────
 
+_REC_ICON = {"強力加碼": "🚀", "加碼": "↑", "持平": "→", "減碼": "↓", "強力減碼": "⚠"}
+_REC_RANK = {"強力加碼": 5, "加碼": 4, "持平": 3, "減碼": 2, "強力減碼": 1}
+
+
 def _direction_label(excess: float, n: int) -> str:
     """Label a condition based on its excess edge vs baseline."""
     # Require minimum statistical confidence: penalise small samples
@@ -1250,8 +1256,35 @@ def fmt_report(r: dict) -> str:
         f"{reg_str}{fut_str}  合計: {r['combined']:+.3f}"
     )
     rec  = r['recommendation']
-    icon = {"強力加碼": "🚀", "加碼": "↑", "持平": "→", "減碼": "↓", "強力減碼": "⚠"}.get(rec, "")
+    icon = _REC_ICON.get(rec, "")
     lines.append(f"  ▶ 未來一週建議: 【{rec}】 {icon}")
+    lines.append("=" * W)
+    return "\n".join(lines)
+
+
+def fmt_summary_table(results: list[dict]) -> str:
+    """Multi-stock comparison table, sorted 強力加碼 → 加碼 → 持平 → 減碼 → 強力減碼
+    (ties broken by combined score, descending)."""
+    W = 70
+    lines: list[str] = []
+    lines.append("=" * W)
+    lines.append("  綜合比較表（依建議排序）")
+    lines.append("-" * W)
+    col_w = [6, 8, 9, 8, 8, 8]
+    lines.append(
+        f"  {'股票':<{col_w[0]}}{'公司名':<{col_w[1]}}{'收盤價':>{col_w[2]}}"
+        f"{'技術分':>{col_w[3]}}{'籌碼分':>{col_w[4]}}{'合計':>{col_w[5]}}  建議"
+    )
+    ordered = sorted(results, key=lambda r: (-_REC_RANK.get(r['recommendation'], 0), -r['combined']))
+    for r in ordered:
+        rec = r['recommendation']
+        icon = _REC_ICON.get(rec, "")
+        lines.append(
+            f"  {r['symbol']:<{col_w[0]}}{(r.get('company_name') or ''):<{col_w[1]}}"
+            f"{r['price']:>{col_w[2]}.2f}{r['tech_score']:>+{col_w[3]}.3f}"
+            f"{r['inst_score']*0.12:>+{col_w[4]}.2f}{r['combined']:>+{col_w[5]}.3f}"
+            f"  【{rec}】{icon}"
+        )
     lines.append("=" * W)
     return "\n".join(lines)
 
@@ -1276,6 +1309,7 @@ def main():
         ev_str = "、".join(f"{e['date'].strftime('%-m/%-d')} {e['name']}" for e in macro_events)
         print(f"⚠ 重大事件提醒（未來7天）：{ev_str}")
 
+    results = []
     for sym in sys.argv[1:]:
         sym = sym.strip().upper()
         try:
@@ -1292,10 +1326,15 @@ def main():
             result['company_name'] = company_name
             result['earnings_date'] = fetch_stock_earnings_date(ticker)
             print(fmt_report(result))
+            results.append(result)
         except Exception as e:
             import traceback
             print(f"[錯誤] {sym}: {e}")
             traceback.print_exc()
+
+    if len(results) > 1:
+        print()
+        print(fmt_summary_table(results))
 
 
 if __name__ == "__main__":
